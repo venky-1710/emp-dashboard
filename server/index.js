@@ -14,56 +14,85 @@ const __dirname = dirname(__filename);
 
 dotenv.config();
 
+// Initialize Express app
 const app = express();
+
+// Middleware
 app.use(express.json());
-app.use(cors());
+app.use(cors({
+  origin: 'http://localhost:5173',
+  credentials: true
+}));
 app.use('/uploads', express.static(path.join(__dirname, '../uploads')));
 
-mongoose.connect('mongodb://127.0.0.1:27017/employee_dashboard', {
-  useNewUrlParser: true,
-  useUnifiedTopology: true
-}).then(() => {
-  console.log('Connected to MongoDB');
-}).catch((err) => {
-  console.error('MongoDB connection error:', err);
-});
+// MongoDB Connection with retry logic
+const connectDB = async () => {
+  try {
+    await mongoose.connect('mongodb+srv://venky:venky8086@e-commerce-cluster.xbgmy.mongodb.net/employee_dashboard', {
+      useNewUrlParser: true,
+      useUnifiedTopology: true,
+      serverSelectionTimeoutMS: 5000,
+      family: 4
+    });
+    console.log('MongoDB Connected Successfully');
+  } catch (err) {
+    console.error('MongoDB Connection Error:', err);
+    // Retry connection after 5 seconds
+    setTimeout(connectDB, 5000);
+  }
+};
 
-// Admin Model
+connectDB();
+
+// Models
 const adminSchema = new mongoose.Schema({
-  email: String,
-  password: String
+  email: { type: String, required: true, unique: true },
+  password: { type: String, required: true }
 });
 
-const Admin = mongoose.model('Admin', adminSchema);
-
-// Employee Model
 const employeeSchema = new mongoose.Schema({
-  name: String,
-  email: String,
-  mobile: String,
-  designation: String,
-  gender: String,
-  course: String,
-  image: String,
+  name: { type: String, required: true },
+  email: { type: String, required: true },
+  mobile: { type: String, required: true },
+  designation: { type: String, required: true },
+  gender: { type: String, required: true },
+  course: { type: String, required: true },
+  image: { type: String },
   createdAt: { type: Date, default: Date.now }
 });
 
+const Admin = mongoose.model('Admin', adminSchema);
 const Employee = mongoose.model('Employee', employeeSchema);
 
-// Multer configuration
+// Multer Configuration
 const storage = multer.diskStorage({
-  destination: function(req, file, cb) {
-    cb(null, path.join(__dirname, '../uploads/'));
+  destination: (req, file, cb) => {
+    const uploadDir = path.join(__dirname, '../uploads');
+    cb(null, uploadDir);
   },
-  filename: function(req, file, cb) {
-    cb(null, file.fieldname + '-' + Date.now() + path.extname(file.originalname));
+  filename: (req, file, cb) => {
+    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+    cb(null, file.fieldname + '-' + uniqueSuffix + path.extname(file.originalname));
   }
 });
 
-const upload = multer({ storage: storage });
+const upload = multer({ 
+  storage,
+  fileFilter: (req, file, cb) => {
+    const allowedTypes = ['image/jpeg', 'image/png', 'image/gif'];
+    if (allowedTypes.includes(file.mimetype)) {
+      cb(null, true);
+    } else {
+      cb(new Error('Invalid file type. Only JPEG, PNG and GIF are allowed.'));
+    }
+  },
+  limits: {
+    fileSize: 5 * 1024 * 1024 // 5MB limit
+  }
+});
 
-// Create default admin if not exists
-async function createDefaultAdmin() {
+// Create default admin
+const createDefaultAdmin = async () => {
   try {
     const adminExists = await Admin.findOne({ email: 'admin@admin.com' });
     if (!adminExists) {
@@ -77,22 +106,34 @@ async function createDefaultAdmin() {
   } catch (error) {
     console.error('Error creating default admin:', error);
   }
-}
-
-createDefaultAdmin();
+};
 
 // Auth Middleware
 const authenticateToken = (req, res, next) => {
-  const authHeader = req.headers['authorization'];
-  const token = authHeader && authHeader.split(' ')[1];
+  try {
+    const authHeader = req.headers['authorization'];
+    const token = authHeader && authHeader.split(' ')[1];
 
-  if (!token) return res.status(401).json({ message: 'Unauthorized' });
+    if (!token) {
+      return res.status(401).json({ message: 'No token provided' });
+    }
 
-  jwt.verify(token, process.env.JWT_SECRET || 'your-secret-key', (err, user) => {
-    if (err) return res.status(403).json({ message: 'Invalid token' });
-    req.user = user;
-    next();
-  });
+    jwt.verify(token, process.env.JWT_SECRET || 'your-secret-key', (err, user) => {
+      if (err) {
+        return res.status(403).json({ message: 'Invalid token' });
+      }
+      req.user = user;
+      next();
+    });
+  } catch (error) {
+    res.status(500).json({ message: 'Authentication error' });
+  }
+};
+
+// Error handling middleware
+const errorHandler = (err, req, res, next) => {
+  console.error(err.stack);
+  res.status(500).json({ message: 'Something went wrong!' });
 };
 
 // Routes
@@ -110,10 +151,15 @@ app.post('/api/login', async (req, res) => {
       return res.status(401).json({ message: 'Invalid credentials' });
     }
 
-    const token = jwt.sign({ id: admin._id }, process.env.JWT_SECRET || 'your-secret-key');
+    const token = jwt.sign(
+      { id: admin._id },
+      process.env.JWT_SECRET || 'your-secret-key',
+      { expiresIn: '24h' }
+    );
+    
     res.json({ token });
   } catch (error) {
-    res.status(500).json({ message: 'Server error' });
+    res.status(500).json({ message: 'Login error' });
   }
 });
 
@@ -157,7 +203,14 @@ app.put('/api/employees/:id', authenticateToken, upload.single('image'), async (
     if (req.file) {
       updateData.image = `/uploads/${req.file.filename}`;
     }
-    const employee = await Employee.findByIdAndUpdate(req.params.id, updateData, { new: true });
+    const employee = await Employee.findByIdAndUpdate(
+      req.params.id,
+      updateData,
+      { new: true }
+    );
+    if (!employee) {
+      return res.status(404).json({ message: 'Employee not found' });
+    }
     res.json(employee);
   } catch (error) {
     res.status(500).json({ message: 'Error updating employee' });
@@ -166,14 +219,29 @@ app.put('/api/employees/:id', authenticateToken, upload.single('image'), async (
 
 app.delete('/api/employees/:id', authenticateToken, async (req, res) => {
   try {
-    await Employee.findByIdAndDelete(req.params.id);
+    const employee = await Employee.findByIdAndDelete(req.params.id);
+    if (!employee) {
+      return res.status(404).json({ message: 'Employee not found' });
+    }
     res.json({ message: 'Employee deleted successfully' });
   } catch (error) {
     res.status(500).json({ message: 'Error deleting employee' });
   }
 });
 
+// Apply error handling middleware
+app.use(errorHandler);
+
+// Initialize server
 const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
+mongoose.connection.once('open', () => {
+  app.listen(PORT, () => {
+    console.log(`Server running on port ${PORT}`);
+    createDefaultAdmin();
+  });
+});
+
+// Handle MongoDB connection errors
+mongoose.connection.on('error', (err) => {
+  console.error('MongoDB connection error:', err);
 });
